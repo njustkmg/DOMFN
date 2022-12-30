@@ -1,2 +1,2 @@
-# DOMFN
-This is the official code for DOMFN
+# DOMFN_Paddle
+This is the official Paddle code for DOMFN
