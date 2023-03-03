@@ -1,7 +1,7 @@
 # DOMFN
 This is the official code for DOMFN
 
-Two branch: torch & paddle
+Two branch: torch & paddle & MindSpore
 
 Paper:
 
