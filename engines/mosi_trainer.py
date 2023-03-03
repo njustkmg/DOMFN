@@ -1,13 +1,40 @@
 from tqdm import tqdm
 import os
-import torch
+import mindspore as ms
+import mindspore.nn as nn
+import mindspore.ops as ops
 from scipy import stats
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, mean_absolute_error
-from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+# from torch.utils.data import DataLoader
+from mindspore import ReduceLROnPlateau
+from mindspore.common import ParameterTuple
+from mindspore.ops.composite import GradOperation
+
+TEXT_IDX = 0
+VISION_IDX = 1
+AUDIO_IDX = 2
+LABEL_IDX = 3
+
+
+class MyLoss(nn.LossBase):
+    def __init__(self, target_loss = None, reduction='mean'):
+        super().__init__(reduction)
+        self.target_loss = target_loss
+
+    def construct(self, outdict, label = None):
+        return outdict[self.target_loss]
+
+
+class MyWithLossCell(nn.Cell):
+   def __init__(self, backbone, loss_fn):
+       super(MyWithLossCell, self).__init__(auto_prefix=False)
+       self._backbone = backbone
+       self._loss_fn = loss_fn
+
+   def construct(self):
+       out = self._backbone()
+       return self._loss_fn(out)
 
 class DomfnTrainer(object):
     def __init__(self, config, model):
@@ -15,87 +42,89 @@ class DomfnTrainer(object):
 
         self.model = model
 
+        #10.22
         if config.use_cuda:
-            torch.device('cuda：0')
+            ms.set_context(mode=ms.PYNATIVE_MODE, device_target = 'GPU')
         else:
-            torch.device('cpu')
+            ms.set_context(mode=ms.PYNATIVE_MODE, device_target = 'CPU')
 
         self.text_model = self.model.text_encoder
         self.vision_model = self.model.vision_encoder
         self.audio_model = self.model.audio_encoder
         self.multi_model = self.model.multi_encoder
 
-        self.text_optim = optim.Adam(list(self.text_model.parameters()),
-                                     lr=self.config.pre_lr,
-                                     weight_decay=self.config.weight_decay_text)
-        self.vision_optim = optim.Adam(list(self.vision_model.parameters()),
-                                       lr=self.config.text_ft_lr,
-                                       weight_decay=self.config.weight_decay_vision)
-        self.audio_optim = optim.Adam(list(self.audio_model.parameters()),
-                                      lr=self.config.pre_lr,
-                                      weight_decay=self.config.weight_decay_audio)
-        self.multi_optim = optim.Adam(list(self.multi_model.parameters()),
-                                      lr=self.config.multi_lr,
-                                      weight_decay=self.config.weight_decay_multi)
-        self.text_scheduler = ReduceLROnPlateau(self.text_optim, 'min', factor=0.5,
-                                                patience=self.config.patience, verbose=True)
-        self.vision_scheduler = ReduceLROnPlateau(self.vision_optim, 'min', factor=0.5,
-                                                  patience=self.config.patience, verbose=True)
-        self.audio_scheduler = ReduceLROnPlateau(self.audio_optim, 'min', factor=0.5,
-                                                 patience=self.config.patience, verbose=True)
-        self.multi_scheduler = ReduceLROnPlateau(self.audio_optim, 'min', factor=0.5,
-                                                 patience=self.config.patience, verbose=True)
+        self.text_optim  = nn.Adam( params=list(self.text_model.trainable_params()),
+                                    learning_rate=self.config.pre_lr,
+                                    weight_decay=self.config.weight_decay_text)
+        self.vision_optim= nn.Adam( params=list(self.vision_model.trainable_params()),
+                                    learning_rate=self.config.text_ft_lr,
+                                    weight_decay=self.config.weight_decay_vision)
+        self.audio_optim = nn.Adam( params=list(self.audio_model.trainable_params()),
+                                    learning_rate=self.config.pre_lr,
+                                    weight_decay=self.config.weight_decay_audio)
+        self.multi_optim = nn.Adam( params=list(self.multi_model.trainable_params()),
+                                    learning_rate=self.config.multi_lr,
+                                    weight_decay=self.config.weight_decay_multi)
+
+        #10.22
+        self.text_pretrainer = nn.WithGradCell(self.text_model, MyLoss('celoss'))
+        self.vision_pretrainer = nn.WithGradCell(self.vision_model, MyLoss('celoss'))
+        self.audio_pretrainer = nn.WithGradCell(self.audio_model, MyLoss('celoss'))
+
+        self.text_trainer = nn.TrainOneStepCell(MyWithLossCell(self.text_model, MyLoss('loss')), self.text_optim)
+        self.vision_trainer = nn.TrainOneStepCell(MyWithLossCell(self.vision_model, MyLoss('loss')), self.vision_optim)
+        self.audio_trainer = nn.TrainOneStepCell(MyWithLossCell(self.audio_model, MyLoss('loss')), self.audio_optim)
+
+        self.multi_trainer = nn.WithGradCell(self.model, MyLoss('multi_loss'))
+
 
     def train(self, train_loader):
-        self.model.train()
+        self.model.set_train()
+        # self.model.set_grad()
         train_tqdm = tqdm(train_loader)
         all_out = []
         all_label = []
         all_loss = []
         if self.config.is_pretrain:
-            for param_group in self.text_optim.param_groups:
-                param_group['lr'] = self.config.text_ft_lr
-            for param_group in self.vision_optim.param_groups:
-                param_group['lr'] = self.config.vision_ft_lr
-            for param_group in self.audio_optim.param_groups:
-                param_group['lr'] = self.config.audio_ft_lr
+            self.text_optim.learning_rate.set_data(self.config.text_ft_lr) 
+            self.vision_optim.learning_rate.set_data(self.config.vision_ft_lr)
+            self.audio_optim.learning_rate.set_data(self.config.audio_ft_lr)
 
+        multi_cnt = 0
+        uni_cnt = 0
         for batch in train_tqdm:
-            labels = batch['labels']
-            output = self.model(**batch, eta=self.config.eta)
+            labels = batch[LABEL_IDX]
+            output = self.model([*batch, self.config.eta])
 
             text_p = output['text_penalty'] / self.config.tau
             vision_p = output['vision_penalty'] / self.config.tau
             audio_p = output['audio_penalty'] / self.config.tau
-            loss = output['text_loss'] + output['vision_loss'] + \
-                   output['audio_loss'] + output['multi_loss']
 
+            _ = None
             if text_p < self.config.gamma and vision_p < self.config.gamma and audio_p < self.config.gamma:
 
-                self.text_optim.zero_grad()
-                self.vision_optim.zero_grad()
-                self.audio_optim.zero_grad()
-                self.multi_optim.zero_grad()
-                loss.backward()
-                self.text_optim.step()
-                self.vision_optim.step()
-                self.audio_optim.step()
-                self.multi_optim.step()
+                multi_cnt += 1
+                loss = output['multi_loss']
+                all_grads = self.multi_trainer([*batch, self.config.eta], _)
+                text_grads = all_grads[:8]
+                vision_grads = all_grads[8:16]
+                audio_grads = all_grads[16:24]
+                multi_grads = all_grads[24:28]
+                text_success = self.text_optim(text_grads)
+                vision_success = self.vision_optim(vision_grads)
+                audio_success = self.audio_optim(audio_grads)
+                multi_success = self.multi_optim(multi_grads)
+
                 out = output['multi_logit']
             else:
-                self.text_optim.zero_grad()
-                output['text_celoss'].backward(retain_graph=True)
-                self.text_optim.step()
-                self.vision_optim.zero_grad()
-                output['vision_celoss'].backward(retain_graph=True)
-                self.vision_optim.step()
-                self.audio_optim.zero_grad()
-                output['audio_celoss'].backward(retain_graph=True)
-                self.audio_optim.step()
+                
+                loss1 = output['text_loss'] + output['vision_loss'] + output['audio_loss']
+                uni_cnt += 1
 
-                text_conf, text_pred = torch.max(output['text_logit'], dim=1)
-                vision_conf, vision_pred = torch.max(output['vision_logit'], dim=1)
-                audio_conf, audio_pred = torch.max(output['audio_logit'], dim=1)
+                loss = self.text_trainer() + self.vision_trainer() + self.audio_trainer()
+                text_pred, text_conf = ops.ArgMaxWithValue(axis=1)(output['text_logit'])
+                vision_pred, vision_conf = ops.ArgMaxWithValue(axis=1)(output['vision_logit'])
+                audio_pred, audio_conf = ops.ArgMaxWithValue(axis=1)(output['audio_logit'])
 
                 if text_conf > vision_conf and text_conf > audio_conf:
                     out = output['text_logit']
@@ -104,68 +133,70 @@ class DomfnTrainer(object):
                 elif audio_conf > text_conf and audio_conf > vision_conf:
                     out = output['audio_logit']
 
-            if len(out.size()) == 1:
-                out = torch.unsqueeze(out, dim=0)
-            all_out += out.detach().cpu().numpy().tolist()
-            all_label += labels.cpu().numpy().tolist()
-            all_loss.append(loss.item())
-            train_tqdm.set_description('Loss: {}, text_p: {}, vision_p: {}, audio_p: {}'.format(
-                np.mean(all_loss), text_p.item(), vision_p.item(), audio_p.item()))
+                if len(out.shape) == 1:
+                    out = ops.expand_dims(out, axis=0)
+
+            
+            all_out += out.asnumpy().tolist()
+            all_label += labels.asnumpy().tolist()
+            all_loss.append(loss.asnumpy().item(0))
+            train_tqdm.set_description('Loss: {}, text_p: {}, vision_p: {}, audio_p: {}, muiti: {}, uni: {}'.format(
+                np.mean(all_loss), text_p.item(0), vision_p.item(0), audio_p.item(0), multi_cnt, uni_cnt))
         labels = np.array(all_label).reshape(-1)
         one_hot_targets = np.eye(self.config.num_label)[labels]
         mae = mean_absolute_error(one_hot_targets, all_out)
         return np.mean(all_loss), mae
 
     def pre_train(self, train_loader):
-        self.model.train()
+        self.model.set_train()
+        
         train_tqdm = tqdm(train_loader)
         all_text_loss = []
         all_vision_loss = []
         all_audio_loss = []
         for batch in train_tqdm:
-            output = self.model(**batch, eta=self.config.eta)
-            loss = output['text_celoss'] + output['vision_celoss'] + output['audio_celoss']
-            self.text_optim.zero_grad()
-            self.vision_optim.zero_grad()
-            self.audio_optim.zero_grad()
-            loss.backward()
-            self.text_optim.step()
-            self.vision_optim.step()
-            self.audio_optim.step()
-            all_text_loss.append(output['text_celoss'].item())
-            all_vision_loss.append(output['vision_celoss'].item())
-            all_audio_loss.append(output['audio_celoss'].item())
+            _ = None
+            text_grads = self.text_pretrainer([batch[TEXT_IDX], batch[LABEL_IDX]], _)
+            vision_grads = self.vision_pretrainer([batch[VISION_IDX], batch[LABEL_IDX]], _)
+            audio_grads = self.audio_pretrainer([batch[AUDIO_IDX], batch[LABEL_IDX]], _)
+            text_success = self.text_optim(text_grads)
+            vision_success = self.vision_optim(vision_grads)
+            audio_success = self.audio_optim(audio_grads)
+
+            all_text_loss.append(self.text_model.celoss.asnumpy().item(0))
+            all_vision_loss.append(self.vision_model.celoss.asnumpy().item(0))
+            all_audio_loss.append(self.audio_model.celoss.asnumpy().item(0))
+
         return np.mean(all_text_loss), np.mean(all_vision_loss), np.mean(all_audio_loss)
 
     def evaluate(self, model, valid_loader):
-        model.eval()
+        model.set_train(False)
+        # model.set_grad(False)
         all_out = []
         all_label = []
         all_loss = []
         for batch in valid_loader:
-            with torch.no_grad():
-                labels = batch['labels']
-                output = model(**batch, eta=self.config.eta)
-                loss = output['text_loss'] + output['vision_loss'] + \
-                       output['audio_loss'] + output['multi_loss']
-                text_p = output['text_penalty'] / self.config.tau
-                vision_p = output['vision_penalty'] / self.config.tau
-                audio_p = output['audio_penalty'] / self.config.tau
-                text_conf, _ = torch.max(output['text_logit'], dim=1)
-                vision_conf, _ = torch.max(output['vision_logit'], dim=1)
-                audio_conf, _ = torch.max(output['audio_logit'], dim=1)
+            labels = batch[LABEL_IDX]
+            output = model([*batch, self.config.eta])
+            loss =  output['multi_loss']
+            text_p = output['text_penalty'] / self.config.tau
+            vision_p = output['vision_penalty'] / self.config.tau
+            audio_p = output['audio_penalty'] / self.config.tau
+            _, text_conf = ops.ArgMaxWithValue(axis=1)(output['text_logit'])
+            _, vision_conf = ops.ArgMaxWithValue(axis=1)(output['vision_logit'])
+            _, audio_conf = ops.ArgMaxWithValue(axis=1)(output['audio_logit'])
 
-                if text_p < self.config.gamma and vision_p < self.config.gamma and audio_p < self.config.gamma:
-                    out = output['multi_logit'].detach().cpu().numpy()
-                elif text_conf > vision_conf and text_conf > audio_conf:
-                    out = output['text_logit'].detach().cpu().numpy()
-                elif vision_conf > text_conf and vision_conf > audio_conf:
-                    out = output['vision_logit'].detach().cpu().numpy()
-                elif audio_conf > vision_conf and audio_conf > vision_conf:
-                    out = output['audio_logit'].detach().cpu().numpy()
-            all_loss.append(loss.item())
-            all_out += out.tolist()
-            all_label += labels.tolist()
+            if text_p < self.config.gamma and vision_p < self.config.gamma and audio_p < self.config.gamma:
+                out = output['multi_logit']
+            elif text_conf > vision_conf and text_conf > audio_conf:
+                out = output['text_logit']
+            elif vision_conf > text_conf and vision_conf > audio_conf:
+                out = output['vision_logit']
+            elif audio_conf > vision_conf and audio_conf > vision_conf:
+                out = output['audio_logit']
+            all_out += out.asnumpy().tolist()
+            all_label += labels.asnumpy().tolist()
+            all_loss.append(loss.asnumpy().item(0))
         labels = np.array(all_label).reshape(-1)
         one_hot_targets = np.eye(self.config.num_label)[labels]
         mae = mean_absolute_error(one_hot_targets, all_out)
@@ -175,7 +206,7 @@ class DomfnTrainer(object):
 
         loss, mae, all_out, all_label, one_hot_targets = self.evaluate(model, test_loader)
         corr = np.mean(np.corrcoef(all_out, one_hot_targets))
-        # predict = np.array([np.array(all_out) >= choose_threshold], dtype='int')
+
         predict = np.argmax(all_out, axis=1)
         acc = accuracy_score(all_label, predict)
         precision = precision_score(all_label, predict, average='macro')
@@ -189,4 +220,4 @@ class DomfnTrainer(object):
                 'f1': f1}
 
     def save(self, model_path):
-        torch.save(self.model, model_path)
+        ms.save_checkpoint(self.model, model_path)

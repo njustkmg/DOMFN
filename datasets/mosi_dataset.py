@@ -1,13 +1,11 @@
 import pickle as pkl
 import numpy as np
-import h5py
-import torch
+# import h5py
 import os
+import mindspore
 
-from torch.utils.data import Dataset
 
-
-class MosiDataset(Dataset):
+class MosiDataset():
     def __init__(self,
                  vision=None,
                  text=None,
@@ -21,7 +19,6 @@ class MosiDataset(Dataset):
         :param audio_data:
         :param labels
         '''
-        super(MosiDataset, self).__init__()
         self.vision_data = vision
         self.text_data = text
         self.audio_data = audio
@@ -32,13 +29,11 @@ class MosiDataset(Dataset):
         inst_text = np.max(self.text_data[index], axis=0)
         inst_audio = np.max(self.audio_data[index], axis=0)
         inst_label = self.labels[index] + 3
-
-        return {
-            'vision_embeds': torch.tensor(inst_vision, dtype=torch.float32),
-            'text_embeds': torch.tensor(inst_text, dtype=torch.float32),
-            'audio_embeds': torch.tensor(inst_audio, dtype=torch.float32),
-            'labels': np.long(inst_label)
-        }
+        tmp = mindspore.Tensor(inst_text, dtype=mindspore.float32)
+        return mindspore.Tensor(inst_text, dtype=mindspore.float32), \
+               mindspore.Tensor(inst_vision, dtype=mindspore.float32), \
+               mindspore.Tensor(inst_audio, dtype=mindspore.float32), \
+               np.long(inst_label)
 
     def __len__(self):
         return self.vision_data.shape[0]
